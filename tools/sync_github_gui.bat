@@ -1,21 +1,63 @@
 @echo off
 chcp 65001 >nul
 setlocal
-start "" /b powershell.exe -NoProfile -WindowStyle Hidden -STA -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 '%~f0' | Select-Object -Skip 6) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -ScriptDir '%~dp0'"
+
+set "TARGET_DIR="
+
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%~1"=="--dir" (
+    if not "%~2"=="" (
+        set "TARGET_DIR=%~2"
+        shift
+    )
+    shift
+    goto parse_args
+)
+if not defined TARGET_DIR (
+    set "TARGET_DIR=%~1"
+    shift
+    goto parse_args
+)
+shift
+goto parse_args
+:done_args
+
+set "SYNC_SCRIPT_DIR=%~dp0"
+set "SYNC_TARGET_DIR=%TARGET_DIR%"
+
+start "" /b powershell.exe -NoProfile -WindowStyle Hidden -STA -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 '%~f0' | Select-Object -Skip 31) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -ScriptDir $env:SYNC_SCRIPT_DIR -TargetDir $env:SYNC_TARGET_DIR"
 exit /b 0
 :: --- POWERSHELL PAYLOAD BELOW ---
 param(
-    [string]$ScriptDir = (Get-Location).Path
+    [string]$TargetDir = "",
+    [string]$ScriptDir = ""
 )
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-# Resolve Git repo root from wherever this .bat was launched
-Set-Location $ScriptDir
+# Resolve script directory (default fallback: %~dp0 or current directory)
+if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
+    $ScriptDir = (Get-Location).Path
+}
+$fallbackDir = (Resolve-Path -LiteralPath $ScriptDir -ErrorAction SilentlyContinue).Path
+if (-not $fallbackDir) { $fallbackDir = $ScriptDir.TrimEnd('\', '/') }
+
+$chosenDir = $null
+if (-not [string]::IsNullOrWhiteSpace($TargetDir)) {
+    if (Test-Path -LiteralPath $TargetDir) {
+        $chosenDir = (Resolve-Path -LiteralPath $TargetDir -ErrorAction SilentlyContinue).Path
+    }
+}
+if (-not $chosenDir) {
+    $chosenDir = $fallbackDir
+}
+
+Set-Location $chosenDir
 $RepoRoot = (git rev-parse --show-toplevel 2>$null)
 if (-not $RepoRoot) {
     [System.Windows.MessageBox]::Show(
-        "This folder is not inside a Git repository:`n$ScriptDir",
+        "This folder is not inside a Git repository:`n$chosenDir",
         "GitHub Sync - Error",
         [System.Windows.MessageBoxButton]::OK,
         [System.Windows.MessageBoxImage]::Error
@@ -172,7 +214,7 @@ function Add-Log([string]$msg) {
     Do-Events
 }
 
-function Run-Git([string]$argsStr) {
+function Run-Git([string]$argsStr, [int]$timeoutSec = 120) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "git"
     $psi.Arguments = $argsStr
@@ -184,14 +226,23 @@ function Run-Git([string]$argsStr) {
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     $p = [System.Diagnostics.Process]::Start($psi)
+
+    # Async pipe drain prevents buffer deadlocks
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while (-not $p.HasExited) {
-        Start-Sleep -Milliseconds 40
+        if ($sw.Elapsed.TotalSeconds -gt $timeoutSec) {
+            try { $p.Kill() } catch {}
+            return [PSCustomObject]@{ ExitCode = -1; Out = ""; Err = "Timed out after ${timeoutSec}s" }
+        }
+        Start-Sleep -Milliseconds 30
         Do-Events
     }
     return [PSCustomObject]@{
         ExitCode = $p.ExitCode
-        Out      = $p.StandardOutput.ReadToEnd().Trim()
-        Err      = $p.StandardError.ReadToEnd().Trim()
+        Out      = $outTask.GetAwaiter().GetResult().Trim()
+        Err      = $errTask.GetAwaiter().GetResult().Trim()
     }
 }
 

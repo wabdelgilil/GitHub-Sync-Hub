@@ -1,13 +1,43 @@
 @echo off
 chcp 65001 >nul
 setlocal
+
+set "TARGET_DIR="
 set "AUTO_ARG="
-if /I "%~1"=="--auto" set "AUTO_ARG=-Auto"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 '%~f0' | Select-Object -Skip 8) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -ScriptDir '%~dp0' %AUTO_ARG%"
+
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%~1"=="--auto" (
+    set "AUTO_ARG=-Auto"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="--dir" (
+    if not "%~2"=="" (
+        set "TARGET_DIR=%~2"
+        shift
+    )
+    shift
+    goto parse_args
+)
+if not defined TARGET_DIR (
+    set "TARGET_DIR=%~1"
+    shift
+    goto parse_args
+)
+shift
+goto parse_args
+:done_args
+
+set "SYNC_SCRIPT_DIR=%~dp0"
+set "SYNC_TARGET_DIR=%TARGET_DIR%"
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 '%~f0' | Select-Object -Skip 37) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -ScriptDir $env:SYNC_SCRIPT_DIR -TargetDir $env:SYNC_TARGET_DIR %AUTO_ARG%"
 exit /b %ERRORLEVEL%
 :: --- POWERSHELL PAYLOAD BELOW ---
 param(
-    [string]$ScriptDir = (Get-Location).Path,
+    [string]$TargetDir = "",
+    [string]$ScriptDir = "",
     [switch]$Auto
 )
 
@@ -37,7 +67,7 @@ function Show-Progress {
 }
 
 function Invoke-GitWithSpinner {
-    param([string]$Arguments, [string]$Message)
+    param([string]$Arguments, [string]$Message, [int]$TimeoutSec = 120)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "git"
     $psi.Arguments = $Arguments
@@ -53,22 +83,31 @@ function Invoke-GitWithSpinner {
     $proc.StartInfo = $psi
     [void]$proc.Start()
 
+    # Drain stdout/stderr asynchronously to prevent Windows 4KB pipe buffer deadlocks
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $frames = @('|', '/', '-', '\')
     $idx = 0
     while (-not $proc.HasExited) {
+        if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec) {
+            try { $proc.Kill() } catch {}
+            Write-Host -NoNewline "`r                                                                      `r"
+            return [PSCustomObject]@{ ExitCode = -1; StdOut = ""; StdErr = "Timed out after ${TimeoutSec}s" }
+        }
         $f = $frames[$idx % $frames.Length]
         Write-Host -NoNewline "`r  ${C_CYAN}$f${C_RESET} $Message...   "
-        Start-Sleep -Milliseconds 110
+        Start-Sleep -Milliseconds 60
         $idx++
     }
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
     Write-Host -NoNewline "`r                                                                      `r"
+    $stdout = $outTask.GetAwaiter().GetResult().Trim()
+    $stderr = $errTask.GetAwaiter().GetResult().Trim()
     return [PSCustomObject]@{
         ExitCode = $proc.ExitCode
-        StdOut   = $stdout.Trim()
-        StdErr   = $stderr.Trim()
+        StdOut   = $stdout
+        StdErr   = $stderr
     }
 }
 
@@ -81,11 +120,32 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-Set-Location $ScriptDir
+# Resolve script directory (default fallback: %~dp0 or current directory)
+if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
+    $ScriptDir = (Get-Location).Path
+}
+$fallbackDir = (Resolve-Path -LiteralPath $ScriptDir -ErrorAction SilentlyContinue).Path
+if (-not $fallbackDir) { $fallbackDir = $ScriptDir.TrimEnd('\', '/') }
+
+$chosenDir = $null
+if (-not [string]::IsNullOrWhiteSpace($TargetDir)) {
+    if (Test-Path -LiteralPath $TargetDir) {
+        $chosenDir = (Resolve-Path -LiteralPath $TargetDir -ErrorAction SilentlyContinue).Path
+    } else {
+        Write-Host "`n  ${C_YELLOW}[!] Warning: Specified directory not found: '$TargetDir'${C_RESET}"
+        Write-Host "      ${C_DIM}Defaulting to script directory: '$fallbackDir'${C_RESET}`n"
+    }
+}
+if (-not $chosenDir) {
+    $chosenDir = $fallbackDir
+}
+$WorkingDir = $chosenDir.TrimEnd('\', '/')
+
+Set-Location $WorkingDir
 $RepoRoot = (git rev-parse --show-toplevel 2>$null)
 if (-not $RepoRoot) {
     Write-Host "`n  ${C_RED}[X] This folder is not inside a Git repository:${C_RESET}"
-    Write-Host "      ${C_DIM}$ScriptDir${C_RESET}`n"
+    Write-Host "      ${C_DIM}$WorkingDir${C_RESET}`n"
     if (-not $Auto) { Read-Host "  Press Enter to exit" }
     exit 1
 }
@@ -106,9 +166,9 @@ $Host.UI.RawUI.WindowTitle = "GitHub Sync - $ProjName [$Branch]"
 # Header Banner
 Write-Host ""
 Write-Host "  ${C_CYAN}╔══════════════════════════════════════════════════════════════╗${C_RESET}"
-Write-Host ("  ${C_CYAN}║${C_RESET}  ${C_BOLD}${C_WHITE}GITHUB TWO-WAY SYNC${C_RESET}  ${C_DIM}|${C_RESET}  ${C_GREEN}{0,-37}${C_RESET}${C_CYAN}║${C_RESET}" -f $ProjName)
+Write-Host ("  ${C_CYAN}║${C_RESET}  ${C_BOLD}${C_WHITE}GITHUB TWO-WAY SYNC${C_RESET}  ${C_DIM}|${C_RESET}  ${C_GREEN}{0,-37}${C_RESET}${C_CYAN}║${C_RESET}" -f ($ProjName.Substring(0, [Math]::Min(37, $ProjName.Length))))
 Write-Host "  ${C_CYAN}╠══════════════════════════════════════════════════════════════╣${C_RESET}"
-Write-Host ("  ${C_CYAN}║${C_RESET}  ${C_DIM}Branch :${C_RESET} ${C_YELLOW}{0,-50}${C_RESET}${C_CYAN}║${C_RESET}" -f $Branch)
+Write-Host ("  ${C_CYAN}║${C_RESET}  ${C_DIM}Branch :${C_RESET} ${C_YELLOW}{0,-50}${C_RESET}${C_CYAN}║${C_RESET}" -f ($Branch.Substring(0, [Math]::Min(50, $Branch.Length))))
 Write-Host ("  ${C_CYAN}║${C_RESET}  ${C_DIM}Folder :${C_RESET} ${C_WHITE}{0,-50}${C_RESET}${C_CYAN}║${C_RESET}" -f ($RepoRoot.Substring(0, [Math]::Min(50, $RepoRoot.Length))))
 if ($LastCommit) {
     $lcShort = if ($LastCommit.Length -gt 50) { $LastCommit.Substring(0, 47) + "..." } else { $LastCommit }
@@ -150,65 +210,82 @@ if ($StatusLines.Count -gt 0) {
         $CommitMsg = if ([string]::IsNullOrWhiteSpace($UserInput)) { $DefaultMsg } else { $UserInput.Trim() }
     }
 
-    $addRes = Invoke-GitWithSpinner -Arguments "add -A" -Message "Staging files"
-    if ($addRes.ExitCode -ne 0) {
-        Write-Host "  ${C_RED}[X] git add failed: $($addRes.StdErr)${C_RESET}"
-        if (-not $Auto) { Read-Host "`n  Press Enter to exit" }
+    Show-Progress -Percent 25 -Label "Staging all changes..."
+    $res = Invoke-GitWithSpinner -Arguments "add -A" -Message "Staging files (git add -A)"
+    if ($res.ExitCode -ne 0) {
+        Write-Host "`n  ${C_RED}[X] git add failed:${C_RESET} $($res.StdErr)"
+        if (-not $Auto) { Read-Host "  Press Enter to exit" }
         exit 1
     }
 
-    $escapedMsg = $CommitMsg.Replace('"', '\"')
-    $comRes = Invoke-GitWithSpinner -Arguments "commit -m `"$escapedMsg`"" -Message "Committing changes"
-    if ($comRes.ExitCode -ne 0) {
-        Write-Host "  ${C_RED}[X] git commit failed: $($comRes.StdErr)${C_RESET}"
-        if (-not $Auto) { Read-Host "`n  Press Enter to exit" }
+    Show-Progress -Percent 40 -Label "Committing changes..."
+    $escMsg = $CommitMsg.Replace('"', '\"')
+    $res = Invoke-GitWithSpinner -Arguments "commit -m `"$escMsg`"" -Message "Creating commit"
+    if ($res.ExitCode -ne 0) {
+        Write-Host "`n  ${C_RED}[X] git commit failed:${C_RESET} $($res.StdErr)"
+        if (-not $Auto) { Read-Host "  Press Enter to exit" }
         exit 1
     }
-    Write-Host "  ${C_GREEN}[OK] Committed:${C_RESET} $CommitMsg"
+    Write-Host "  ${C_GREEN}[OK] Local changes committed:${C_RESET} $CommitMsg"
 } else {
-    Write-Host "  ${C_DIM}[1/3] Working tree is clean - no local changes to commit.${C_RESET}"
+    Write-Host "  ${C_GREEN}[1/3] Working tree clean (nothing to commit).${C_RESET}"
+    Show-Progress -Percent 40 -Label "Working tree clean"
 }
 
-Show-Progress -Percent 45 -Label "Pulling remote updates..."
-
-# STEP 2: Pull with rebase
-$pullRes = Invoke-GitWithSpinner -Arguments "pull --rebase --autostash origin $Branch" -Message "Pulling from origin/$Branch"
-if ($pullRes.ExitCode -ne 0) {
-    Write-Host ""
-    Write-Host "  ${C_RED}[X] Pull/Rebase failed or conflict detected:${C_RESET}"
-    if ($pullRes.StdErr) { Write-Host "      ${C_DIM}$($pullRes.StdErr)${C_RESET}" }
-    Write-Host "  ${C_YELLOW}Tip: Resolve conflicts, then run 'git rebase --continue'.${C_RESET}"
-    if (-not $Auto) { Read-Host "`n  Press Enter to exit" }
-    exit 1
-}
-Write-Host "  ${C_GREEN}[OK] Pulled & synced with origin/$Branch.${C_RESET}"
-
-Show-Progress -Percent 75 -Label "Checking commits to push..."
-
-# STEP 3: Push if ahead
-$aheadRaw = (git rev-list --count "origin/$Branch..HEAD" 2>$null)
-$AheadCount = if ($aheadRaw -match "^\d+$") { [int]$aheadRaw } else { 0 }
-
-if ($AheadCount -gt 0) {
-    $pushRes = Invoke-GitWithSpinner -Arguments "push origin $Branch" -Message "Pushing $AheadCount commit(s) to GitHub"
-    if ($pushRes.ExitCode -ne 0) {
-        Write-Host "  ${C_RED}[X] Push failed:${C_RESET} $($pushRes.StdErr)"
-        if (-not $Auto) { Read-Host "`n  Press Enter to exit" }
+# STEP 2: Pull latest changes from remote
+Write-Host ""
+if (-not $RemoteUrl) {
+    Write-Host "  ${C_YELLOW}[2/3] No remote 'origin' configured. Skipping pull.${C_RESET}"
+    Show-Progress -Percent 70 -Label "No remote configured"
+} else {
+    Write-Host "  ${C_CYAN}[2/3] Pulling latest changes from origin/$Branch...${C_RESET}"
+    Show-Progress -Percent 55 -Label "Pulling from origin/$Branch..."
+    $res = Invoke-GitWithSpinner -Arguments "pull --rebase --autostash origin $Branch" -Message "Pulling updates (rebase + autostash)"
+    if ($res.ExitCode -ne 0) {
+        Write-Host "`n  ${C_RED}[X] Pull failed with conflicts or network error:${C_RESET}"
+        Write-Host "      $($res.StdErr)"
+        Write-Host "`n  ${C_YELLOW}Resolve merge conflicts manually, then re-run.${C_RESET}"
+        if (-not $Auto) { Read-Host "  Press Enter to exit" }
         exit 1
     }
-    Write-Host "  ${C_GREEN}[OK] Pushed $AheadCount commit(s) to origin/$Branch.${C_RESET}"
-} else {
-    Write-Host "  ${C_DIM}[3/3] Already up to date with origin/$Branch.${C_RESET}"
+    Write-Host "  ${C_GREEN}[OK] Remote changes pulled successfully.${C_RESET}"
+    Show-Progress -Percent 70 -Label "Pull completed"
 }
 
-Show-Progress -Percent 100 -Label "All operations complete!"
+# STEP 3: Push local commits to remote
+Write-Host ""
+if (-not $RemoteUrl) {
+    Write-Host "  ${C_YELLOW}[3/3] No remote 'origin' configured. Skipping push.${C_RESET}"
+    Show-Progress -Percent 100 -Label "Complete (Local repo only)"
+} else {
+    Write-Host "  ${C_CYAN}[3/3] Checking for outgoing commits...${C_RESET}"
+    $AheadCount = (git rev-list --count origin/$Branch..HEAD 2>$null)
+    if ($AheadCount -match "^\d+$" -and [int]$AheadCount -gt 0) {
+        Write-Host "        Detected $AheadCount commit(s) ahead of origin/$Branch."
+        Show-Progress -Percent 85 -Label "Pushing $AheadCount commit(s) to origin/$Branch..."
+        $res = Invoke-GitWithSpinner -Arguments "push origin $Branch" -Message "Pushing commits to GitHub"
+        if ($res.ExitCode -ne 0) {
+            Write-Host "`n  ${C_RED}[X] Push failed:${C_RESET} $($res.StdErr)"
+            if (-not $Auto) { Read-Host "  Press Enter to exit" }
+            exit 1
+        }
+        Write-Host "  ${C_GREEN}[OK] Successfully pushed $AheadCount commit(s) to GitHub!${C_RESET}"
+        Show-Progress -Percent 100 -Label "Sync complete!"
+    } else {
+        Write-Host "  ${C_GREEN}[OK] Already up to date with origin/$Branch (0 outgoing commits).${C_RESET}"
+        Show-Progress -Percent 100 -Label "Everything up to date!"
+    }
+}
+
+# Completion Summary
 Write-Host ""
 Write-Host "  ${C_GREEN}╔══════════════════════════════════════════════════════════════╗${C_RESET}"
-Write-Host "  ${C_GREEN}║            SYNC COMPLETED SUCCESSFULLY                       ║${C_RESET}"
+Write-Host "  ${C_GREEN}║${C_RESET}  ${C_BOLD}${C_GREEN}TWO-WAY SYNC COMPLETED SUCCESSFULLY${C_RESET}                        ${C_GREEN}║${C_RESET}"
 Write-Host "  ${C_GREEN}╚══════════════════════════════════════════════════════════════╝${C_RESET}"
+Write-Host ""
+
 if (-not $Auto) {
-    try { [Console]::Beep(880, 110); [Console]::Beep(1175, 140) } catch {}
-    Write-Host ""
+    try { [Console]::Beep(880, 100); [Console]::Beep(1175, 130) } catch {}
     Read-Host "  Press Enter to close"
 }
 exit 0

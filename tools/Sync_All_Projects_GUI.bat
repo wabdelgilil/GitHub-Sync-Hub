@@ -1,15 +1,65 @@
 @echo off
 chcp 65001 >nul
 setlocal
-start "" /b powershell.exe -NoProfile -WindowStyle Hidden -STA -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 '%~f0' | Select-Object -Skip 6) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -BaseDir '%~dp0'"
+
+set "TARGET_DIR="
+
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%~1"=="--dir" (
+    if not "%~2"=="" (
+        set "TARGET_DIR=%~2"
+        shift
+    )
+    shift
+    goto parse_args
+)
+if not defined TARGET_DIR (
+    set "TARGET_DIR=%~1"
+    shift
+    goto parse_args
+)
+shift
+goto parse_args
+:done_args
+
+set "SYNC_SCRIPT_DIR=%~dp0"
+set "SYNC_TARGET_DIR=%TARGET_DIR%"
+
+start "" /b powershell.exe -NoProfile -WindowStyle Hidden -STA -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 '%~f0' | Select-Object -Skip 31) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -ScriptDir $env:SYNC_SCRIPT_DIR -TargetDir $env:SYNC_TARGET_DIR"
 exit /b 0
 :: --- POWERSHELL PAYLOAD BELOW ---
 param(
-    [string]$BaseDir = (Get-Location).Path
+    [string]$TargetDir = "",
+    [string]$ScriptDir = "",
+    [string]$BaseDir = ""
 )
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
-$BaseDir = $BaseDir.TrimEnd('\', '/')
+
+# Resolve script directory (default fallback: %~dp0 or current directory)
+if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
+    $ScriptDir = if (-not [string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir } else { (Get-Location).Path }
+}
+$fallbackDir = (Resolve-Path -LiteralPath $ScriptDir -ErrorAction SilentlyContinue).Path
+if (-not $fallbackDir) { $fallbackDir = $ScriptDir.TrimEnd('\', '/') }
+
+$chosenDir = $null
+$candidate = if (-not [string]::IsNullOrWhiteSpace($TargetDir)) { $TargetDir } elseif (-not [string]::IsNullOrWhiteSpace($BaseDir) -and $BaseDir -ne $ScriptDir) { $BaseDir } else { $null }
+
+$initialWarning = $null
+if ($candidate) {
+    if (Test-Path -LiteralPath $candidate) {
+        $chosenDir = (Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue).Path
+    } else {
+        $initialWarning = "Warning: Specified directory '$candidate' does not exist. Defaulted to '$fallbackDir'."
+    }
+}
+
+if (-not $chosenDir) {
+    $chosenDir = $fallbackDir
+}
+$script:BaseDir = $chosenDir.TrimEnd('\', '/')
 
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -72,7 +122,13 @@ $BaseDir = $BaseDir.TrimEnd('\', '/')
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0">
                     <TextBlock Text="Multi-Project GitHub Sync Hub" FontSize="20" FontWeight="Bold" Foreground="#38BDF8"/>
-                    <TextBlock x:Name="TxtBase" Text="$BaseDir" FontSize="11.5" Foreground="#94A3B8" Margin="0,2,0,0"/>
+                    <DockPanel Margin="0,6,12,0" LastChildFill="True">
+                        <Button x:Name="BtnBrowse" Content="Browse Workspace..." Style="{StaticResource SmallBtn}"
+                                Background="#1E3A8A" Foreground="#93C5FD" Padding="10,4" Margin="0,0,10,0"
+                                VerticalAlignment="Center" Cursor="Hand" ToolTip="Select a different workspace or parent projects directory"/>
+                        <TextBlock x:Name="TxtBase" Text="$script:BaseDir" FontSize="11.5" Foreground="#94A3B8"
+                                   VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                    </DockPanel>
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                     <Border Background="#0C4A6E" CornerRadius="6" Padding="10,5" Margin="0,0,8,0">
@@ -157,6 +213,8 @@ $BaseDir = $BaseDir.TrimEnd('\', '/')
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 
+$BtnBrowse       = $window.FindName("BtnBrowse")
+$TxtBase         = $window.FindName("TxtBase")
 $GridRepos       = $window.FindName("GridRepos")
 $TxtRepoCount    = $window.FindName("TxtRepoCount")
 $TxtChangedCount = $window.FindName("TxtChangedCount")
@@ -173,6 +231,7 @@ $BtnPull         = $window.FindName("BtnPull")
 $BtnPush         = $window.FindName("BtnPush")
 $BtnGitHub       = $window.FindName("BtnGitHub")
 
+$TxtBase.Text = $script:BaseDir
 $script:RepoItems = New-Object System.Collections.ObjectModel.ObservableCollection[Object]
 $GridRepos.ItemsSource = $script:RepoItems
 
@@ -226,6 +285,7 @@ function Run-Git([string]$repoPath, [string]$argsStr, [int]$timeoutSec = 120) {
 
 function Set-Busy([bool]$busy) {
     $en = -not $busy
+    $BtnBrowse.IsEnabled     = $en
     $BtnSync.IsEnabled       = $en
     $BtnPull.IsEnabled       = $en
     $BtnPush.IsEnabled       = $en
@@ -241,11 +301,11 @@ function Scan-Repositories {
     $script:RepoItems.Clear()
     $paths = @()
 
-    $selfCheck = Run-Git $BaseDir "rev-parse --show-toplevel"
+    $selfCheck = Run-Git $script:BaseDir "rev-parse --show-toplevel"
     if ($selfCheck.ExitCode -eq 0 -and $selfCheck.Out) {
         $paths += $selfCheck.Out
     } else {
-        Get-ChildItem -Path $BaseDir -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
+        Get-ChildItem -Path $script:BaseDir -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
             if (Test-Path (Join-Path $_.FullName ".git")) { $paths += $_.FullName }
         }
     }
@@ -303,9 +363,32 @@ function Scan-Repositories {
         $BadgeChanged.Background = "#14532D"
         $TxtChangedCount.Foreground = "#86EFAC"
     }
-    Add-Log "Scanned $BaseDir -> Found $($script:RepoItems.Count) Git repository(s), $changedTotal with pending changes."
+    Add-Log "Scanned $script:BaseDir -> Found $($script:RepoItems.Count) Git repository(s), $changedTotal with pending changes."
     Set-Busy $false
 }
+
+$BtnBrowse.Add_Click({
+    $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+    $fbd.Description = "Select Git Workspace or Parent Projects Folder"
+    $fbd.ShowNewFolderButton = $true
+    if (Test-Path -LiteralPath $script:BaseDir) {
+        $fbd.SelectedPath = $script:BaseDir
+    }
+    $res = $fbd.ShowDialog()
+    if ($res -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($fbd.SelectedPath)) {
+        $sel = $fbd.SelectedPath.TrimEnd('\', '/')
+        if (Test-Path -LiteralPath $sel) {
+            $resolved = (Resolve-Path -LiteralPath $sel).Path.TrimEnd('\', '/')
+            if ($resolved -ne $script:BaseDir) {
+                $script:BaseDir = $resolved
+                $TxtBase.Text = $script:BaseDir
+                Add-Log "Switched workspace directory to: $script:BaseDir"
+                Scan-Repositories
+            }
+        }
+    }
+    $fbd.Dispose()
+})
 
 $BtnRefresh.Add_Click({ Scan-Repositories })
 
@@ -508,5 +591,8 @@ $BtnSync.Add_Click({ Run-BatchAction "SYNC" })
 $BtnPull.Add_Click({ Run-BatchAction "PULL" })
 $BtnPush.Add_Click({ Run-BatchAction "PUSH" })
 
-$window.Add_ContentRendered({ Scan-Repositories })
+$window.Add_ContentRendered({
+    if ($initialWarning) { Add-Log $initialWarning }
+    Scan-Repositories
+})
 $window.ShowDialog() | Out-Null

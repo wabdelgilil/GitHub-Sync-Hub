@@ -1,13 +1,45 @@
 @echo off
 chcp 65001 >nul
 setlocal
+
+set "BATCH_PATH=%~f0"
+set "SYNC_SCRIPT_DIR=%~dp0"
+set "TARGET_DIR="
 set "AUTO_ARG="
-if /I "%~1"=="--auto" set "AUTO_ARG=-Auto"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 '%~f0' | Select-Object -Skip 8) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -BaseDir '%~dp0' %AUTO_ARG%"
+
+:parse_args
+if "%~1"=="" goto done_args
+if /I "%~1"=="--auto" (
+    set "AUTO_ARG=-Auto"
+    shift /1
+    goto parse_args
+)
+if /I "%~1"=="--dir" (
+    if not "%~2"=="" (
+        set "TARGET_DIR=%~2"
+        shift /1
+    )
+    shift /1
+    goto parse_args
+)
+if not defined TARGET_DIR (
+    set "TARGET_DIR=%~1"
+    shift /1
+    goto parse_args
+)
+shift /1
+goto parse_args
+:done_args
+
+set "SYNC_TARGET_DIR=%TARGET_DIR%"
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 $env:BATCH_PATH | Select-Object -Skip 38) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -ScriptDir $env:SYNC_SCRIPT_DIR -TargetDir $env:SYNC_TARGET_DIR %AUTO_ARG%"
 exit /b %ERRORLEVEL%
 :: --- POWERSHELL PAYLOAD BELOW ---
 param(
-    [string]$BaseDir = (Get-Location).Path,
+    [string]$TargetDir = "",
+    [string]$ScriptDir = "",
+    [string]$BaseDir = "",
     [switch]$Auto
 )
 
@@ -24,6 +56,30 @@ $C_GREEN  = "$ESC[92m"
 $C_YELLOW = "$ESC[93m"
 $C_RED    = "$ESC[91m"
 $C_WHITE  = "$ESC[97m"
+
+# Resolve script directory (default fallback: %~dp0 or current directory)
+if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
+    $ScriptDir = if (-not [string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir } else { (Get-Location).Path }
+}
+$fallbackDir = (Resolve-Path -LiteralPath $ScriptDir -ErrorAction SilentlyContinue).Path
+if (-not $fallbackDir) { $fallbackDir = $ScriptDir.TrimEnd('\', '/') }
+
+$chosenDir = $null
+$candidate = if (-not [string]::IsNullOrWhiteSpace($TargetDir)) { $TargetDir } elseif (-not [string]::IsNullOrWhiteSpace($BaseDir) -and $BaseDir -ne $ScriptDir) { $BaseDir } else { $null }
+
+if ($candidate) {
+    if (Test-Path -LiteralPath $candidate) {
+        $chosenDir = (Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue).Path
+    } else {
+        Write-Host "`n  ${C_YELLOW}[!] Warning: Specified directory does not exist: '$candidate'${C_RESET}"
+        Write-Host "      ${C_DIM}Defaulting to script directory: '$fallbackDir'${C_RESET}`n"
+    }
+}
+
+if (-not $chosenDir) {
+    $chosenDir = $fallbackDir
+}
+$BaseDir = $chosenDir.TrimEnd('\', '/')
 
 function Invoke-GitProc {
     param([string]$RepoPath, [string]$Arguments, [string]$SpinMsg = "", [int]$TimeoutSec = 120)
@@ -84,7 +140,7 @@ function Discover-Repos {
     $RootDir = $RootDir.TrimEnd('\', '/')
     $found = @()
 
-    # Check if BaseDir itself is inside a Git repo
+    # Check if RootDir itself is inside a Git repo
     $selfTop = (Invoke-GitProc -RepoPath $RootDir -Arguments "rev-parse --show-toplevel")
     if ($selfTop.ExitCode -eq 0 -and $selfTop.Out) {
         $found += $selfTop.Out
@@ -138,7 +194,7 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 Write-Host ""
 Write-Host "  ${C_CYAN}╔══════════════════════════════════════════════════════════════════════╗${C_RESET}"
 Write-Host "  ${C_CYAN}║${C_RESET}  ${C_BOLD}${C_WHITE}MULTI-PROJECT GITHUB SYNC HUB${C_RESET}                                       ${C_CYAN}║${C_RESET}"
-Write-Host ("  ${C_CYAN}║${C_RESET}  ${C_DIM}Workspace : {0,-56}${C_RESET}${C_CYAN}║${C_RESET}" -f $BaseDir.TrimEnd('\'))
+Write-Host ("  ${C_CYAN}║${C_RESET}  ${C_DIM}Workspace : {0,-56}${C_RESET}${C_CYAN}║${C_RESET}" -f ($BaseDir.Substring(0, [Math]::Min(56, $BaseDir.Length))))
 Write-Host "  ${C_CYAN}╚══════════════════════════════════════════════════════════════════════╝${C_RESET}"
 Write-Host ""
 Write-Host "  ${C_DIM}Scanning for Git repositories...${C_RESET}"
