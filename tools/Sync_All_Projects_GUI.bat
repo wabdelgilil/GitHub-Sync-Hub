@@ -2,6 +2,8 @@
 chcp 65001 >nul
 setlocal
 
+set "BATCH_PATH=%~f0"
+set "SYNC_SCRIPT_DIR=%~dp0"
 set "TARGET_DIR="
 
 :parse_args
@@ -9,24 +11,23 @@ if "%~1"=="" goto done_args
 if /I "%~1"=="--dir" (
     if not "%~2"=="" (
         set "TARGET_DIR=%~2"
-        shift
+        shift /1
     )
-    shift
+    shift /1
     goto parse_args
 )
 if not defined TARGET_DIR (
     set "TARGET_DIR=%~1"
-    shift
+    shift /1
     goto parse_args
 )
-shift
+shift /1
 goto parse_args
 :done_args
 
-set "SYNC_SCRIPT_DIR=%~dp0"
 set "SYNC_TARGET_DIR=%TARGET_DIR%"
 
-start "" /b powershell.exe -NoProfile -WindowStyle Hidden -STA -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 '%~f0' | Select-Object -Skip 31) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -ScriptDir $env:SYNC_SCRIPT_DIR -TargetDir $env:SYNC_TARGET_DIR"
+start "" /b powershell.exe -NoProfile -WindowStyle Hidden -STA -ExecutionPolicy Bypass -Command "$code = (Get-Content -Encoding UTF8 $env:BATCH_PATH | Select-Object -Skip 32) -join [Environment]::NewLine; & ([ScriptBlock]::Create($code)) -ScriptDir $env:SYNC_SCRIPT_DIR -TargetDir $env:SYNC_TARGET_DIR"
 exit /b 0
 :: --- POWERSHELL PAYLOAD BELOW ---
 param(
@@ -37,6 +38,17 @@ param(
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
 
+# Early Git Verification
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    [System.Windows.Forms.MessageBox]::Show(
+        "Git is not installed or not found in system PATH.`n`nPlease install Git for Windows (https://git-scm.com) and ensure 'git.exe' is available in your PATH.",
+        "GitHub Sync Hub - Git Not Found",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+    exit 1
+}
+
 # Resolve script directory (default fallback: %~dp0 or current directory)
 if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
     $ScriptDir = if (-not [string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir } else { (Get-Location).Path }
@@ -45,9 +57,11 @@ $fallbackDir = (Resolve-Path -LiteralPath $ScriptDir -ErrorAction SilentlyContin
 if (-not $fallbackDir) { $fallbackDir = $ScriptDir.TrimEnd('\', '/') }
 
 $chosenDir = $null
+$initialWarning = $null
+
+# Priority 1: Check if a path argument is provided via command line
 $candidate = if (-not [string]::IsNullOrWhiteSpace($TargetDir)) { $TargetDir } elseif (-not [string]::IsNullOrWhiteSpace($BaseDir) -and $BaseDir -ne $ScriptDir) { $BaseDir } else { $null }
 
-$initialWarning = $null
 if ($candidate) {
     if (Test-Path -LiteralPath $candidate) {
         $chosenDir = (Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue).Path
@@ -56,6 +70,24 @@ if ($candidate) {
     }
 }
 
+# Priority 2: If no argument is passed in GUI mode, open native FolderBrowserDialog
+if (-not $chosenDir) {
+    $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+    $fbd.Description = "Select Git Workspace or Parent Projects Folder (Click Cancel to use script directory)"
+    $fbd.ShowNewFolderButton = $true
+    if (Test-Path -LiteralPath $fallbackDir) {
+        $fbd.SelectedPath = $fallbackDir
+    }
+    $dialogRes = $fbd.ShowDialog()
+    if ($dialogRes -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($fbd.SelectedPath)) {
+        if (Test-Path -LiteralPath $fbd.SelectedPath) {
+            $chosenDir = (Resolve-Path -LiteralPath $fbd.SelectedPath).Path
+        }
+    }
+    $fbd.Dispose()
+}
+
+# Priority 3: Fall back to %~dp0 (script folder)
 if (-not $chosenDir) {
     $chosenDir = $fallbackDir
 }
@@ -264,6 +296,7 @@ function Run-Git([string]$repoPath, [string]$argsStr, [int]$timeoutSec = 120) {
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     $p = [System.Diagnostics.Process]::Start($psi)
+
     # Async drain prevents 4KB Windows pipe buffer deadlocks on large repos
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
@@ -308,6 +341,17 @@ function Scan-Repositories {
         Get-ChildItem -Path $script:BaseDir -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
             if (Test-Path (Join-Path $_.FullName ".git")) { $paths += $_.FullName }
         }
+    }
+
+    if ($paths.Count -eq 0) {
+        $TxtRepoCount.Text = "0 Repositories"
+        $TxtChangedCount.Text = "No Git Repos"
+        $BadgeChanged.Background = "#475569"
+        $TxtChangedCount.Foreground = "#CBD5E1"
+        Add-Log "NOTE: No Git repositories (.git) found in: $script:BaseDir"
+        Add-Log "TIP: Click 'Browse Workspace...' above to select a folder containing Git repositories."
+        Set-Busy $false
+        return
     }
 
     $changedTotal = 0

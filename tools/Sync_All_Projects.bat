@@ -57,6 +57,14 @@ $C_YELLOW = "$ESC[93m"
 $C_RED    = "$ESC[91m"
 $C_WHITE  = "$ESC[97m"
 
+# Validate Git presence
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Host "`n  ${C_RED}[X] Git is not installed or not in system PATH.${C_RESET}"
+    Write-Host "      Please install Git for Windows (https://git-scm.com) and ensure 'git.exe' is in your PATH.`n"
+    if (-not $Auto) { Read-Host "  Press Enter to exit" }
+    exit 1
+}
+
 # Resolve script directory (default fallback: %~dp0 or current directory)
 if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
     $ScriptDir = if (-not [string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir } else { (Get-Location).Path }
@@ -65,6 +73,7 @@ $fallbackDir = (Resolve-Path -LiteralPath $ScriptDir -ErrorAction SilentlyContin
 if (-not $fallbackDir) { $fallbackDir = $ScriptDir.TrimEnd('\', '/') }
 
 $chosenDir = $null
+# Priority 1: Check if a path argument is provided via command line
 $candidate = if (-not [string]::IsNullOrWhiteSpace($TargetDir)) { $TargetDir } elseif (-not [string]::IsNullOrWhiteSpace($BaseDir) -and $BaseDir -ne $ScriptDir) { $BaseDir } else { $null }
 
 if ($candidate) {
@@ -76,6 +85,7 @@ if ($candidate) {
     }
 }
 
+# Priority 3 (CLI fallback): %~dp0
 if (-not $chosenDir) {
     $chosenDir = $fallbackDir
 }
@@ -185,11 +195,6 @@ function Discover-Repos {
 }
 
 Clear-Host
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Host "`n  ${C_RED}[X] Git is not installed or not in PATH.${C_RESET}`n"
-    if (-not $Auto) { Read-Host "  Press Enter to exit" }
-    exit 1
-}
 
 Write-Host ""
 Write-Host "  ${C_CYAN}╔══════════════════════════════════════════════════════════════════════╗${C_RESET}"
@@ -201,7 +206,16 @@ Write-Host "  ${C_DIM}Scanning for Git repositories...${C_RESET}"
 
 $Repos = @(Discover-Repos -RootDir $BaseDir)
 if ($Repos.Count -eq 0) {
-    Write-Host "`n  ${C_YELLOW}[!] No Git repositories found in: $BaseDir${C_RESET}`n"
+    Write-Host "`n  ${C_YELLOW}╔══════════════════════════════════════════════════════════════════════╗${C_RESET}"
+    Write-Host "  ${C_YELLOW}║${C_RESET}  ${C_BOLD}NO GIT REPOSITORIES FOUND${C_RESET}                                           ${C_YELLOW}║${C_RESET}"
+    Write-Host "  ${C_YELLOW}╠══════════════════════════════════════════════════════════════════════╣${C_RESET}"
+    Write-Host ("  ${C_YELLOW}║${C_RESET}  Workspace : {0,-56}${C_YELLOW}║${C_RESET}" -f ($BaseDir.Substring(0, [Math]::Min(56, $BaseDir.Length))))
+    Write-Host "  ${C_YELLOW}║${C_RESET}                                                                      ${C_YELLOW}║${C_RESET}"
+    Write-Host "  ${C_YELLOW}║${C_RESET}  No Git repositories (.git) were detected in this folder.             ${C_YELLOW}║${C_RESET}"
+    Write-Host "  ${C_YELLOW}║${C_RESET}  Usage Tips:                                                         ${C_YELLOW}║${C_RESET}"
+    Write-Host "  ${C_YELLOW}║${C_RESET}   - Pass a workspace path: Sync_All_Projects.bat `"C:\Projects`"        ${C_YELLOW}║${C_RESET}"
+    Write-Host "  ${C_YELLOW}║${C_RESET}   - Or copy this script into your parent projects directory.         ${C_YELLOW}║${C_RESET}"
+    Write-Host "  ${C_YELLOW}╚══════════════════════════════════════════════════════════════════════╝${C_RESET}`n"
     if (-not $Auto) { Read-Host "  Press Enter to exit" }
     exit 0
 }
